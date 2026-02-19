@@ -30,8 +30,9 @@ def make_mock_client(status_code: int, body: str = "") -> httpx.AsyncClient:
 
 
 @pytest.mark.anyio
-async def test_http_500_error_returns_jsonrpc_error_for_request():
-    """When a POST for a JSONRPCRequest gets HTTP 500, a JSONRPCError should be
+@pytest.mark.parametrize("status_code", [400, 401, 403, 429, 500, 502, 503])
+async def test_http_error_returns_jsonrpc_error_for_request(status_code: int):
+    """HTTP error status codes should be converted to a JSONRPCError
     delivered to the read stream so the caller doesn't hang."""
     transport = StreamableHTTPTransport(url="http://localhost:9999/mcp")
     write_stream, read_stream = anyio.create_memory_object_stream[SessionMessage | Exception](1)
@@ -39,7 +40,7 @@ async def test_http_500_error_returns_jsonrpc_error_for_request():
     request_msg = JSONRPCRequest(jsonrpc="2.0", id=42, method="tools/list")
     session_msg = SessionMessage(request_msg)
 
-    client = make_mock_client(500)
+    client = make_mock_client(status_code)
     ctx = RequestContext(
         client=client,
         session_id=None,
@@ -51,79 +52,12 @@ async def test_http_500_error_returns_jsonrpc_error_for_request():
     try:
         await transport._handle_post_request(ctx)
 
-        # Should have received a JSONRPCError on the read stream
         received = read_stream.receive_nowait()
         assert isinstance(received, SessionMessage)
         assert isinstance(received.message, JSONRPCError)
         assert received.message.id == 42
         assert received.message.error.code == INTERNAL_ERROR
-        assert "500" in received.message.error.message
-    finally:
-        await write_stream.aclose()
-        await read_stream.aclose()
-        await client.aclose()
-
-
-@pytest.mark.anyio
-async def test_http_502_error_returns_jsonrpc_error_for_request():
-    """HTTP 502 Bad Gateway should also be converted to a JSONRPCError."""
-    transport = StreamableHTTPTransport(url="http://localhost:9999/mcp")
-    write_stream, read_stream = anyio.create_memory_object_stream[SessionMessage | Exception](1)
-
-    request_msg = JSONRPCRequest(jsonrpc="2.0", id="req-1", method="resources/read", params={"uri": "test://resource"})
-    session_msg = SessionMessage(request_msg)
-
-    client = make_mock_client(502)
-    ctx = RequestContext(
-        client=client,
-        session_id=None,
-        session_message=session_msg,
-        metadata=None,
-        read_stream_writer=write_stream,
-    )
-
-    try:
-        await transport._handle_post_request(ctx)
-
-        received = read_stream.receive_nowait()
-        assert isinstance(received, SessionMessage)
-        assert isinstance(received.message, JSONRPCError)
-        assert received.message.id == "req-1"
-        assert received.message.error.code == INTERNAL_ERROR
-        assert "502" in received.message.error.message
-    finally:
-        await write_stream.aclose()
-        await read_stream.aclose()
-        await client.aclose()
-
-
-@pytest.mark.anyio
-async def test_http_503_error_returns_jsonrpc_error_for_request():
-    """HTTP 503 Service Unavailable should also be converted to a JSONRPCError."""
-    transport = StreamableHTTPTransport(url="http://localhost:9999/mcp")
-    write_stream, read_stream = anyio.create_memory_object_stream[SessionMessage | Exception](1)
-
-    request_msg = JSONRPCRequest(jsonrpc="2.0", id=99, method="ping")
-    session_msg = SessionMessage(request_msg)
-
-    client = make_mock_client(503)
-    ctx = RequestContext(
-        client=client,
-        session_id=None,
-        session_message=session_msg,
-        metadata=None,
-        read_stream_writer=write_stream,
-    )
-
-    try:
-        await transport._handle_post_request(ctx)
-
-        received = read_stream.receive_nowait()
-        assert isinstance(received, SessionMessage)
-        assert isinstance(received.message, JSONRPCError)
-        assert received.message.id == 99
-        assert received.message.error.code == INTERNAL_ERROR
-        assert "503" in received.message.error.message
+        assert str(status_code) in received.message.error.message
     finally:
         await write_stream.aclose()
         await read_stream.aclose()
@@ -150,7 +84,6 @@ async def test_http_error_for_notification_does_not_send_to_stream():
     )
 
     try:
-        # Should not raise
         await transport._handle_post_request(ctx)
 
         # Should NOT have written anything to the stream
