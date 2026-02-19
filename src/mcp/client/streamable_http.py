@@ -301,9 +301,7 @@ class StreamableHTTPTransport:
                     code=INTERNAL_ERROR,
                     message=f"HTTP {exc.response.status_code}: {exc.response.reason_phrase}",
                 )
-                error_msg = SessionMessage(
-                    JSONRPCError(jsonrpc="2.0", id=message.id, error=error_data)
-                )
+                error_msg = SessionMessage(JSONRPCError(jsonrpc="2.0", id=message.id, error=error_data))
                 await ctx.read_stream_writer.send(error_msg)
 
     async def _handle_json_response(
