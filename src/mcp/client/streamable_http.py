@@ -19,6 +19,7 @@ from mcp.client._transport import TransportStreams
 from mcp.shared._httpx_utils import create_mcp_http_client
 from mcp.shared.message import ClientMessageMetadata, SessionMessage
 from mcp.types import (
+    INTERNAL_ERROR,
     INVALID_REQUEST,
     PARSE_ERROR,
     ErrorData,
@@ -256,42 +257,54 @@ class StreamableHTTPTransport:
         message = ctx.session_message.message
         is_initialization = self._is_initialization_request(message)
 
-        async with ctx.client.stream(
-            "POST",
-            self.url,
-            json=message.model_dump(by_alias=True, mode="json", exclude_none=True),
-            headers=headers,
-        ) as response:
-            if response.status_code == 202:
-                logger.debug("Received 202 Accepted")
-                return
+        try:
+            async with ctx.client.stream(
+                "POST",
+                self.url,
+                json=message.model_dump(by_alias=True, mode="json", exclude_none=True),
+                headers=headers,
+            ) as response:
+                if response.status_code == 202:
+                    logger.debug("Received 202 Accepted")
+                    return
 
-            if response.status_code == 404:  # pragma: no branch
-                if isinstance(message, JSONRPCRequest):  # pragma: no branch
-                    error_data = ErrorData(code=INVALID_REQUEST, message="Session terminated")
-                    session_message = SessionMessage(JSONRPCError(jsonrpc="2.0", id=message.id, error=error_data))
-                    await ctx.read_stream_writer.send(session_message)
-                return
+                if response.status_code == 404:  # pragma: no branch
+                    if isinstance(message, JSONRPCRequest):  # pragma: no branch
+                        error_data = ErrorData(code=INVALID_REQUEST, message="Session terminated")
+                        session_message = SessionMessage(JSONRPCError(jsonrpc="2.0", id=message.id, error=error_data))
+                        await ctx.read_stream_writer.send(session_message)
+                    return
 
-            response.raise_for_status()
-            if is_initialization:
-                self._maybe_extract_session_id_from_response(response)
+                response.raise_for_status()
+                if is_initialization:
+                    self._maybe_extract_session_id_from_response(response)
 
-            # Per https://modelcontextprotocol.io/specification/2025-06-18/basic#notifications:
-            # The server MUST NOT send a response to notifications.
+                # Per https://modelcontextprotocol.io/specification/2025-06-18/basic#notifications:
+                # The server MUST NOT send a response to notifications.
+                if isinstance(message, JSONRPCRequest):
+                    content_type = response.headers.get("content-type", "").lower()
+                    if content_type.startswith("application/json"):
+                        await self._handle_json_response(
+                            response, ctx.read_stream_writer, is_initialization, request_id=message.id
+                        )
+                    elif content_type.startswith("text/event-stream"):
+                        await self._handle_sse_response(response, ctx, is_initialization)
+                    else:
+                        logger.error(f"Unexpected content type: {content_type}")
+                        error_data = ErrorData(code=INVALID_REQUEST, message=f"Unexpected content type: {content_type}")
+                        error_msg = SessionMessage(JSONRPCError(jsonrpc="2.0", id=message.id, error=error_data))
+                        await ctx.read_stream_writer.send(error_msg)
+        except httpx.HTTPStatusError as exc:
+            logger.warning(f"HTTP error for POST request: {exc.response.status_code}")
             if isinstance(message, JSONRPCRequest):
-                content_type = response.headers.get("content-type", "").lower()
-                if content_type.startswith("application/json"):
-                    await self._handle_json_response(
-                        response, ctx.read_stream_writer, is_initialization, request_id=message.id
-                    )
-                elif content_type.startswith("text/event-stream"):
-                    await self._handle_sse_response(response, ctx, is_initialization)
-                else:
-                    logger.error(f"Unexpected content type: {content_type}")
-                    error_data = ErrorData(code=INVALID_REQUEST, message=f"Unexpected content type: {content_type}")
-                    error_msg = SessionMessage(JSONRPCError(jsonrpc="2.0", id=message.id, error=error_data))
-                    await ctx.read_stream_writer.send(error_msg)
+                error_data = ErrorData(
+                    code=INTERNAL_ERROR,
+                    message=f"HTTP {exc.response.status_code}: {exc.response.reason_phrase}",
+                )
+                error_msg = SessionMessage(
+                    JSONRPCError(jsonrpc="2.0", id=message.id, error=error_data)
+                )
+                await ctx.read_stream_writer.send(error_msg)
 
     async def _handle_json_response(
         self,
